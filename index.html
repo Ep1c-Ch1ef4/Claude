@@ -187,40 +187,175 @@
         let currentDiceType = null;
         let rollTimeout = null;
 
+        // Build a canvas texture atlas with one numbered cell per logical face,
+        // then remap UVs so each face triangle reads from its own cell.
+        function buildFaceTexture(geometry, labels, bgColor) {
+            const nonIdx = geometry.toNonIndexed();
+            const pos = nonIdx.attributes.position;
+            const triCount = pos.count / 3;
+
+            // Group triangles by quantized face normal → one entry per logical face
+            const groupMap = new Map();
+            const groupList = [];
+            for (let t = 0; t < triCount; t++) {
+                const b = t * 3;
+                const ax = pos.getX(b),   ay = pos.getY(b),   az = pos.getZ(b);
+                const bx = pos.getX(b+1), by = pos.getY(b+1), bz = pos.getZ(b+1);
+                const cx = pos.getX(b+2), cy = pos.getY(b+2), cz = pos.getZ(b+2);
+                const ex = bx-ax, ey = by-ay, ez = bz-az;
+                const fx = cx-ax, fy = cy-ay, fz = cz-az;
+                let nx = ey*fz-ez*fy, ny = ez*fx-ex*fz, nz = ex*fy-ey*fx;
+                const len = Math.sqrt(nx*nx + ny*ny + nz*nz);
+                nx /= len; ny /= len; nz /= len;
+                const key = `${Math.round(nx*1000)},${Math.round(ny*1000)},${Math.round(nz*1000)}`;
+                if (!groupMap.has(key)) {
+                    const g = { nx, ny, nz, tris: [] };
+                    groupMap.set(key, g);
+                    groupList.push(g);
+                }
+                groupMap.get(key).tris.push(b);
+            }
+
+            // Texture atlas: grid of CELL×CELL squares, one per face
+            const CELL = 256;
+            const cols = Math.ceil(Math.sqrt(groupList.length));
+            const rows = Math.ceil(groupList.length / cols);
+            const canvas = document.createElement('canvas');
+            canvas.width  = cols * CELL;
+            canvas.height = rows * CELL;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = '#' + bgColor.toString(16).padStart(6, '0');
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            groupList.forEach((g, i) => {
+                const label = i < labels.length ? labels[i] : null;
+                if (label == null) return;
+                const col = i % cols, row = Math.floor(i / cols);
+                const cx2 = col * CELL + CELL / 2;
+                const cy2 = row * CELL + CELL / 2;
+
+                // Subtle circle behind the digit for contrast
+                ctx.fillStyle = 'rgba(255,255,255,0.13)';
+                ctx.beginPath();
+                ctx.arc(cx2, cy2, CELL * 0.36, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.fillStyle = '#ffffff';
+                ctx.font = `bold ${Math.floor(CELL * 0.5)}px monospace`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.shadowColor = 'rgba(0,0,0,0.8)';
+                ctx.shadowBlur = 8;
+                ctx.fillText(String(label), cx2, cy2 + 2);
+                ctx.shadowBlur = 0;
+            });
+
+            // Remap UVs: project each face onto its tangent plane → map to atlas cell
+            const uvArr = new Float32Array(pos.count * 2);
+
+            groupList.forEach((g, gi) => {
+                const col = gi % cols, row = Math.floor(gi / cols);
+                // UV cell bounds (V is flipped: V=1 is canvas top)
+                const u0 = col / cols,       u1 = (col+1) / cols;
+                const v0 = 1-(row+1)/rows,   v1 = 1 - row / rows;
+
+                // Orthonormal tangent frame for this face
+                const nrm = new THREE.Vector3(g.nx, g.ny, g.nz);
+                const helper = Math.abs(nrm.y) < 0.9
+                    ? new THREE.Vector3(0, 1, 0)
+                    : new THREE.Vector3(1, 0, 0);
+                const tU = new THREE.Vector3().crossVectors(helper, nrm).normalize();
+                const tV = new THREE.Vector3().crossVectors(nrm, tU).normalize();
+
+                // Face centroid (average of all vertices in this group)
+                let sx = 0, sy = 0, sz = 0, cnt = 0;
+                g.tris.forEach(b => {
+                    for (let i = b; i < b+3; i++) {
+                        sx += pos.getX(i); sy += pos.getY(i); sz += pos.getZ(i); cnt++;
+                    }
+                });
+                sx /= cnt; sy /= cnt; sz /= cnt;
+
+                // Project vertices onto tangent plane, track bounds
+                let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+                const proj = [];
+                g.tris.forEach(b => {
+                    const tp = [];
+                    for (let i = b; i < b+3; i++) {
+                        const dx = pos.getX(i)-sx, dy = pos.getY(i)-sy, dz = pos.getZ(i)-sz;
+                        const pu = dx*tU.x + dy*tU.y + dz*tU.z;
+                        const pv = dx*tV.x + dy*tV.y + dz*tV.z;
+                        tp.push({ pu, pv, vi: i });
+                        if (pu < minU) minU = pu; if (pu > maxU) maxU = pu;
+                        if (pv < minV) minV = pv; if (pv > maxV) maxV = pv;
+                    }
+                    proj.push(tp);
+                });
+
+                // Fit bbox uniformly into cell with padding, keeping aspect
+                const range  = Math.max(maxU-minU, maxV-minV) || 1;
+                const shiftU = (range - (maxU-minU)) / 2;
+                const shiftV = (range - (maxV-minV)) / 2;
+                const PAD = 0.12;
+
+                proj.forEach(tp => tp.forEach(({ pu, pv, vi }) => {
+                    const nu = (pu - minU + shiftU) / range;
+                    const nv = (pv - minV + shiftV) / range;
+                    uvArr[vi*2]   = u0 + PAD*(u1-u0) + nu*(1-2*PAD)*(u1-u0);
+                    uvArr[vi*2+1] = v0 + PAD*(v1-v0) + nv*(1-2*PAD)*(v1-v0);
+                }));
+            });
+
+            nonIdx.setAttribute('uv', new THREE.BufferAttribute(uvArr, 2));
+            nonIdx.computeVertexNormals();
+            return { geometry: nonIdx, texture: new THREE.CanvasTexture(canvas) };
+        }
+
         function createD4() {
-            const geometry = new THREE.TetrahedronGeometry(1.5);
-            const material = new THREE.MeshStandardMaterial({ color: 0xe74c3c, roughness: 0.3, metalness: 0.1, flatShading: true });
-            return new THREE.Mesh(geometry, material);
+            const { geometry, texture } = buildFaceTexture(
+                new THREE.TetrahedronGeometry(1.5), [1, 2, 3, 4], 0xe74c3c);
+            return new THREE.Mesh(geometry,
+                new THREE.MeshStandardMaterial({ map: texture, roughness: 0.3, metalness: 0.1 }));
         }
 
         function createD6() {
-            const geometry = new THREE.BoxGeometry(1.5, 1.5, 1.5);
-            const material = new THREE.MeshStandardMaterial({ color: 0x2c3e50, roughness: 0.2, metalness: 0.1 });
-            return new THREE.Mesh(geometry, material);
+            const { geometry, texture } = buildFaceTexture(
+                new THREE.BoxGeometry(1.5, 1.5, 1.5), [1, 2, 3, 4, 5, 6], 0x2c3e50);
+            return new THREE.Mesh(geometry,
+                new THREE.MeshStandardMaterial({ map: texture, roughness: 0.2, metalness: 0.1 }));
         }
 
         function createD8() {
-            const geometry = new THREE.OctahedronGeometry(1.5);
-            const material = new THREE.MeshStandardMaterial({ color: 0xf39c12, roughness: 0.3, metalness: 0.1, flatShading: true });
-            return new THREE.Mesh(geometry, material);
+            const { geometry, texture } = buildFaceTexture(
+                new THREE.OctahedronGeometry(1.5), [1, 2, 3, 4, 5, 6, 7, 8], 0xf39c12);
+            return new THREE.Mesh(geometry,
+                new THREE.MeshStandardMaterial({ map: texture, roughness: 0.3, metalness: 0.1 }));
         }
 
         function createD10() {
-            const geometry = new THREE.DodecahedronGeometry(1.3);
-            const material = new THREE.MeshStandardMaterial({ color: 0x9b59b6, roughness: 0.3, metalness: 0.1, flatShading: true });
-            return new THREE.Mesh(geometry, material);
+            // DodecahedronGeometry has 12 faces; label 10 with 0–9 (0 = 10), leave 2 blank
+            const { geometry, texture } = buildFaceTexture(
+                new THREE.DodecahedronGeometry(1.3),
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, null, null], 0x9b59b6);
+            return new THREE.Mesh(geometry,
+                new THREE.MeshStandardMaterial({ map: texture, roughness: 0.3, metalness: 0.1 }));
         }
 
         function createD12() {
-            const geometry = new THREE.DodecahedronGeometry(1.5);
-            const material = new THREE.MeshStandardMaterial({ color: 0x1abc9c, roughness: 0.3, metalness: 0.1, flatShading: true });
-            return new THREE.Mesh(geometry, material);
+            const { geometry, texture } = buildFaceTexture(
+                new THREE.DodecahedronGeometry(1.5),
+                [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 0x1abc9c);
+            return new THREE.Mesh(geometry,
+                new THREE.MeshStandardMaterial({ map: texture, roughness: 0.3, metalness: 0.1 }));
         }
 
         function createD20() {
-            const geometry = new THREE.IcosahedronGeometry(1.5);
-            const material = new THREE.MeshStandardMaterial({ color: 0x3498db, roughness: 0.2, metalness: 0.2, flatShading: true });
-            return new THREE.Mesh(geometry, material);
+            const { geometry, texture } = buildFaceTexture(
+                new THREE.IcosahedronGeometry(1.5),
+                [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20], 0x3498db);
+            return new THREE.Mesh(geometry,
+                new THREE.MeshStandardMaterial({ map: texture, roughness: 0.2, metalness: 0.2 }));
         }
 
         // radius = bounding sphere radius used for collision detection
