@@ -175,7 +175,11 @@
         // Gravity constant
         const GRAVITY = -0.025;
 
+        const FLOOR_Y    = 0.25;  // top surface of innerTray
+        const WALL_INNER = 7.75;  // inner face of tray walls (wall center ±8, thickness 0.5)
+
         let currentDice = null;
+        let currentRadius = 1.5;
         let diceVelocity = { x: 0, y: 0, z: 0 };
         let angularVelocity = { x: 0, y: 0, z: 0 };
         let isRolling = false;
@@ -219,13 +223,14 @@
             return new THREE.Mesh(geometry, material);
         }
 
+        // radius = bounding sphere radius used for collision detection
         const diceTypes = {
-            'D4':  { sides: 4,  create: createD4,  color: 0xe74c3c },
-            'D6':  { sides: 6,  create: createD6,  color: 0x2c3e50 },
-            'D8':  { sides: 8,  create: createD8,  color: 0xf39c12 },
-            'D10': { sides: 10, create: createD10, color: 0x9b59b6 },
-            'D12': { sides: 12, create: createD12, color: 0x1abc9c },
-            'D20': { sides: 20, create: createD20, color: 0x3498db },
+            'D4':  { sides: 4,  create: createD4,  color: 0xe74c3c, radius: 1.50 },
+            'D6':  { sides: 6,  create: createD6,  color: 0x2c3e50, radius: 1.30 }, // sqrt(3)*0.75
+            'D8':  { sides: 8,  create: createD8,  color: 0xf39c12, radius: 1.50 },
+            'D10': { sides: 10, create: createD10, color: 0x9b59b6, radius: 1.30 },
+            'D12': { sides: 12, create: createD12, color: 0x1abc9c, radius: 1.50 },
+            'D20': { sides: 20, create: createD20, color: 0x3498db, radius: 1.50 },
         };
 
         // Build button bar
@@ -261,6 +266,7 @@
             currentDice = diceType.create();
             currentDice.castShadow = true;
             currentDiceType = type;
+            currentRadius = diceType.radius;
 
             currentDice.position.set(
                 (Math.random() - 0.5) * 4,
@@ -358,9 +364,10 @@
             currentDice.rotation.y += angularVelocity.y;
             currentDice.rotation.z += angularVelocity.z;
 
-            // Floor collision
-            if (currentDice.position.y < 1.0) {
-                currentDice.position.y = 1.0;
+            // Floor collision — stop at floor surface + die radius so no clipping
+            const floorStop = FLOOR_Y + currentRadius;
+            if (currentDice.position.y < floorStop) {
+                currentDice.position.y = floorStop;
                 diceVelocity.y = -diceVelocity.y * 0.5;
                 diceVelocity.x *= 0.82;
                 diceVelocity.z *= 0.82;
@@ -371,14 +378,14 @@
                 if (Math.abs(diceVelocity.y) < 0.05) diceVelocity.y = 0;
             }
 
-            // Wall collisions (inner bounds)
-            const bound = 6.5;
-            if (Math.abs(currentDice.position.x) > bound) {
-                currentDice.position.x = Math.sign(currentDice.position.x) * bound;
+            // Wall collisions — stop before inner wall face minus die radius
+            const wallStop = WALL_INNER - currentRadius;
+            if (Math.abs(currentDice.position.x) > wallStop) {
+                currentDice.position.x = Math.sign(currentDice.position.x) * wallStop;
                 diceVelocity.x *= -0.65;
             }
-            if (Math.abs(currentDice.position.z) > bound) {
-                currentDice.position.z = Math.sign(currentDice.position.z) * bound;
+            if (Math.abs(currentDice.position.z) > wallStop) {
+                currentDice.position.z = Math.sign(currentDice.position.z) * wallStop;
                 diceVelocity.z *= -0.65;
             }
 
